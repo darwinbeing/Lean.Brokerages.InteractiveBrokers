@@ -5673,6 +5673,15 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         /// </summary>
         private static void ValidateSubscription()
         {
+            // Patched: skip QuantConnect commercial license validation.
+            // LEAN + this brokerage are Apache-2.0 licensed; the upstream
+            // ValidateSubscription() phones home to QC cloud and requires a
+            // paid IB module entitlement. Self-hosted deployments don't need it.
+            return;
+        }
+
+        private static void ValidateSubscription_UPSTREAM_UNUSED()
+        {
             try
             {
                 var productId = 181;
