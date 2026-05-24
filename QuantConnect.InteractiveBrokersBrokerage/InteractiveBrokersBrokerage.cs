@@ -249,6 +249,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
         private readonly bool _enableDelayedStreamingData = Config.GetBool("ib-enable-delayed-streaming-data");
 
+        // Opt-in: stream true tick-by-tick (reqTickByTickData BidAsk + AllLast) instead of
+        // reqMktData's ~250ms snapshots. Off by default to preserve existing behavior.
+        private readonly bool _useTickByTick = Config.GetBool("ib-use-tick-by-tick");
+
         // The UTC time at which IBAutomater should be restarted and 2FA confirmation should be requested on Sundays (IB's weekly restart)
         private TimeSpan _weeklyRestartUtcTime;
         private DateTime _lastIBAutomaterExitTime;
@@ -1543,6 +1547,11 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _client.Error += HandleError;
             _client.TickPrice += HandleTickPrice;
             _client.TickSize += HandleTickSize;
+            if (_useTickByTick)
+            {
+                _client.TickByTickBidAsk += HandleTickByTickBidAsk;
+                _client.TickByTickAllLast += HandleTickByTickAllLast;
+            }
             _client.CurrentTimeUtc += HandleBrokerTime;
             _client.ReRouteMarketDataRequest += HandleMarketDataReRoute;
             if (!string.IsNullOrEmpty(financialAdvisorsGroupFilter))
@@ -4189,6 +4198,23 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         }
 
         /// <summary>
+        /// Submits true tick-by-tick data requests (reqTickByTickData) for a contract: best
+        /// bid/ask on <paramref name="requestId"/>, and trades on an auxiliary id mapped to the
+        /// same subscription entry. Tick-by-tick requires a real-time subscription (no delayed
+        /// variant) and consumes two market-data lines per symbol.
+        /// </summary>
+        private void RequestTickByTickData(Contract contract, int requestId, SubscriptionEntry entry)
+        {
+            // numberOfTicks = 0 -> streaming; ignoreSize = false -> deliver sizes.
+            Client.ClientSocket.reqTickByTickData(requestId, contract, "BidAsk", 0, false);
+
+            var tradeId = GetNextId();
+            _tickByTickAuxIds[requestId] = tradeId;
+            _subscribedTickers[tradeId] = entry;
+            Client.ClientSocket.reqTickByTickData(tradeId, contract, "AllLast", 0, false);
+        }
+
+        /// <summary>
         /// Handles the re-rout market data request event issued by the IB server
         /// </summary>
         private void HandleMarketDataReRoute(object sender, IB.RerouteMarketDataRequestEventArgs e)
@@ -4261,10 +4287,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                             // track subscription time for minimum delay in unsubscribe
                             _subscriptionTimes[id] = DateTime.UtcNow;
 
-                            RequestMarketData(contract, id);
-
+                            var entry = new SubscriptionEntry { Symbol = subscribeSymbol, PriceMagnifier = priceMagnifier };
                             _subscribedSymbols[symbol] = id;
-                            _subscribedTickers[id] = new SubscriptionEntry { Symbol = subscribeSymbol, PriceMagnifier = priceMagnifier };
+                            _subscribedTickers[id] = entry;
+
+                            if (_useTickByTick)
+                            {
+                                RequestTickByTickData(contract, id, entry);
+                            }
+                            else
+                            {
+                                RequestMarketData(contract, id);
+                            }
 
                             Log.Trace($"InteractiveBrokersBrokerage.Subscribe(): Subscribe Processed: {symbol.Value} ({GetContractDescription(contract)}) # {id}. SubscribedSymbols.Count: {_subscribedSymbols.Count}");
                         }
@@ -4342,7 +4376,19 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                                     _subscriptionTimes.Remove(id);
                                 }
 
-                                Client.ClientSocket.cancelMktData(id);
+                                if (_useTickByTick)
+                                {
+                                    Client.ClientSocket.cancelTickByTickData(id);
+                                    if (_tickByTickAuxIds.TryRemove(id, out var tradeId))
+                                    {
+                                        Client.ClientSocket.cancelTickByTickData(tradeId);
+                                        _subscribedTickers.TryRemove(tradeId, out _);
+                                    }
+                                }
+                                else
+                                {
+                                    Client.ClientSocket.cancelMktData(id);
+                                }
 
                                 SubscriptionEntry entry;
                                 return _subscribedTickers.TryRemove(id, out entry);
@@ -4647,6 +4693,87 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     Time = GetRealTimeTickTime(symbol)
                 };
 
+                _aggregator.Update(tick);
+            }
+        }
+
+        /// <summary>
+        /// Handles a true tick-by-tick best bid/ask update (reqTickByTickData "BidAsk").
+        /// Emits a quote tick directly, unlike the snapshot path that pairs price/size events.
+        /// </summary>
+        private void HandleTickByTickBidAsk(object sender, IB.TickByTickBidAskEventArgs e)
+        {
+            SubscriptionEntry entry;
+            if (!_subscribedTickers.TryGetValue(e.RequestId, out entry))
+            {
+                return;
+            }
+
+            var symbol = entry.Symbol;
+            var bidPrice = e.BidPrice <= 0 ? 0 : Convert.ToDecimal(e.BidPrice) / entry.PriceMagnifier;
+            var askPrice = e.AskPrice <= 0 ? 0 : Convert.ToDecimal(e.AskPrice) / entry.PriceMagnifier;
+
+            if (bidPrice > 0 && askPrice > 0 && bidPrice >= askPrice)
+            {
+                // crossed/locked book in transit; wait for a consistent update
+                return;
+            }
+
+            var tick = new Tick
+            {
+                Symbol = symbol,
+                TickType = TickType.Quote,
+                BidPrice = bidPrice,
+                AskPrice = askPrice,
+                BidSize = e.BidSize < 0 ? 0 : e.BidSize,
+                AskSize = e.AskSize < 0 ? 0 : e.AskSize,
+                Time = GetRealTimeTickTime(symbol)
+            };
+
+            if (askPrice == 0)
+            {
+                tick.Value = bidPrice;
+            }
+            else if (bidPrice == 0)
+            {
+                tick.Value = askPrice;
+            }
+            else
+            {
+                tick.Value = (bidPrice + askPrice) / 2;
+            }
+
+            if (tick.IsValid())
+            {
+                _aggregator.Update(tick);
+            }
+        }
+
+        /// <summary>
+        /// Handles a true tick-by-tick trade (reqTickByTickData "AllLast"). Emits a trade tick.
+        /// </summary>
+        private void HandleTickByTickAllLast(object sender, IB.TickByTickAllLastEventArgs e)
+        {
+            SubscriptionEntry entry;
+            if (!_subscribedTickers.TryGetValue(e.RequestId, out entry))
+            {
+                return;
+            }
+
+            var symbol = entry.Symbol;
+            var price = e.Price <= 0 ? 0 : Convert.ToDecimal(e.Price) / entry.PriceMagnifier;
+
+            var tick = new Tick
+            {
+                Symbol = symbol,
+                TickType = TickType.Trade,
+                Value = price,
+                Quantity = e.Size < 0 ? 0 : e.Size,
+                Time = GetRealTimeTickTime(symbol)
+            };
+
+            if (tick.IsValid())
+            {
                 _aggregator.Update(tick);
             }
         }
@@ -5667,6 +5794,10 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         private bool _maxSubscribedSymbolsReached = false;
         private readonly ConcurrentDictionary<Symbol, int> _subscribedSymbols = new ConcurrentDictionary<Symbol, int>();
         private readonly ConcurrentDictionary<int, SubscriptionEntry> _subscribedTickers = new ConcurrentDictionary<int, SubscriptionEntry>();
+
+        // Tick-by-tick uses two IB requests per symbol (BidAsk + AllLast); maps the primary
+        // subscription id to the auxiliary AllLast request id so both can be cancelled.
+        private readonly ConcurrentDictionary<int, int> _tickByTickAuxIds = new ConcurrentDictionary<int, int>();
 
         /// <summary>
         /// Determines whether the current tick for the NDX index should be skipped,

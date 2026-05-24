@@ -46,6 +46,16 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public event EventHandler<TickSizeEventArgs> TickSize;
 
         /// <summary>
+        /// TickByTickBidAsk event handler (true tick-by-tick best bid/ask).
+        /// </summary>
+        public event EventHandler<TickByTickBidAskEventArgs> TickByTickBidAsk;
+
+        /// <summary>
+        /// TickByTickAllLast event handler (true tick-by-tick trades).
+        /// </summary>
+        public event EventHandler<TickByTickAllLastEventArgs> TickByTickAllLast;
+
+        /// <summary>
         /// NextValidId event handler
         /// </summary>
         public event EventHandler<NextValidIdEventArgs> NextValidId;
@@ -283,6 +293,24 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         public override void tickSize(int tickerId, int field, decimal size)
         {
             OnTickSize(new TickSizeEventArgs(tickerId, field, size));
+        }
+
+        /// <summary>
+        /// Tick-by-tick best bid/ask callback (reqTickByTickData "BidAsk").
+        /// </summary>
+        public override void tickByTickBidAsk(int reqId, long time, double bidPrice, double askPrice,
+            decimal bidSize, decimal askSize, TickAttribBidAsk tickAttribBidAsk)
+        {
+            OnTickByTickBidAsk(new TickByTickBidAskEventArgs(reqId, time, bidPrice, askPrice, bidSize, askSize));
+        }
+
+        /// <summary>
+        /// Tick-by-tick last/all-last trade callback (reqTickByTickData "AllLast").
+        /// </summary>
+        public override void tickByTickAllLast(int reqId, int tickType, long time, double price, decimal size,
+            TickAttribLast tickAttribLast, string exchange, string specialConditions)
+        {
+            OnTickByTickAllLast(new TickByTickAllLastEventArgs(reqId, tickType, time, price, size));
         }
 
         /// <summary>
@@ -670,6 +698,22 @@ namespace QuantConnect.Brokerages.InteractiveBrokers.Client
         protected virtual void OnTickPrice(TickPriceEventArgs e)
         {
             TickPrice?.Invoke(this, e);
+        }
+
+        /// <summary>
+        /// Raises the <see cref="TickByTickBidAsk"/> event.
+        /// </summary>
+        protected virtual void OnTickByTickBidAsk(TickByTickBidAskEventArgs e)
+        {
+            TickByTickBidAsk?.Invoke(this, e);
+        }
+
+        /// <summary>
+        /// Raises the <see cref="TickByTickAllLast"/> event.
+        /// </summary>
+        protected virtual void OnTickByTickAllLast(TickByTickAllLastEventArgs e)
+        {
+            TickByTickAllLast?.Invoke(this, e);
         }
 
         /// <summary>
