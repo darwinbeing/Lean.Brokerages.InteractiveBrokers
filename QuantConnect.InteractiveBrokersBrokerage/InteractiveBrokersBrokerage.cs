@@ -866,7 +866,34 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             _stateManager.IsConnecting = true;
 
             var attempt = 1;
-            const int maxAttempts = 7;
+            // Maximum connection attempts before giving up. 0 (default) means retry indefinitely: the gateway/TWS
+            // may not be started yet, may be restarting for maintenance, or may have exited while we were running,
+            // and in all those cases we want to keep waiting for it to come back rather than terminate the algorithm.
+            // This is independent of whether IBAutomater manages the gateway (ib-skip-automater) so it works in both modes.
+            var maxAttempts = Config.GetInt("ib-connect-max-attempts", 0);
+            // Set when a non-recoverable error is detected (e.g. bad credentials / account download exception). In that
+            // case we must stop retrying and let the exception propagate so the algorithm terminates instead of looping.
+            var fatalConnectError = false;
+
+            // centralizes the retry decision: gives up immediately on a fatal error or shutdown, otherwise backs off
+            // exponentially (capped at 30s) and retries until the configured attempt cap (0 = unlimited) is reached
+            bool ShouldRetry()
+            {
+                if (fatalConnectError || _isDisposeCalled)
+                {
+                    return false;
+                }
+                if (maxAttempts > 0 && attempt >= maxAttempts)
+                {
+                    return false;
+                }
+
+                // 2s, 4s, 8s, 16s ... capped at 30s
+                var backoffMs = Math.Min(30000, 1000 * (int)Math.Pow(2, Math.Min(attempt, 5)));
+                attempt++;
+                // WaitOne returns true if the token was signaled (disposed/cancelled), in which case we stop retrying
+                return !_cancellationTokenSource.Token.WaitHandle.WaitOne(backoffMs);
+            }
 
             var subscribedSymbolsCount = _subscriptionManager.GetSubscribedSymbols().Count();
             if (subscribedSymbolsCount > 0)
@@ -879,7 +906,7 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             {
                 try
                 {
-                    Log.Trace("InteractiveBrokersBrokerage.Connect(): Attempting to connect ({0}/{1}) ...", attempt, maxAttempts);
+                    Log.Trace("InteractiveBrokersBrokerage.Connect(): Attempting to connect ({0}/{1}) ...", attempt, maxAttempts > 0 ? maxAttempts.ToString() : "unlimited");
 
                     // we're going to receive fresh values for all account data, so we clear all
                     _accountData.Clear();
@@ -940,10 +967,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                         // no response, disconnect and retry
                         Disconnect();
 
-                        // max out at 5 attempts to connect ~1 minute
-                        if (attempt++ < maxAttempts)
+                        if (ShouldRetry())
                         {
-                            Thread.Sleep(1000);
                             continue;
                         }
 
@@ -970,14 +995,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                             if (_accountHoldingsLastException != null)
                             {
-                                // if an exception was thrown during account download, do not retry but exit immediately
-                                attempt = maxAttempts;
+                                // a real error was thrown during account download (e.g. bad credentials): this is not
+                                // recoverable by retrying, so flag it as fatal and exit immediately
+                                fatalConnectError = true;
                                 throw new Exception(_accountHoldingsLastException.Message, _accountHoldingsLastException);
                             }
 
-                            if (attempt++ < maxAttempts)
+                            if (ShouldRetry())
                             {
-                                Thread.Sleep(1000);
                                 continue;
                             }
 
@@ -994,14 +1019,14 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
 
                             if (_accountHoldingsLastException != null)
                             {
-                                // if an exception was thrown during account download, do not retry but exit immediately
-                                attempt = maxAttempts;
+                                // a real error was thrown during account download (e.g. bad credentials): this is not
+                                // recoverable by retrying, so flag it as fatal and exit immediately
+                                fatalConnectError = true;
                                 throw new Exception(_accountHoldingsLastException.Message, _accountHoldingsLastException);
                             }
 
-                            if (attempt++ < maxAttempts)
+                            if (ShouldRetry())
                             {
-                                Thread.Sleep(1000);
                                 continue;
                             }
 
@@ -1016,10 +1041,8 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 }
                 catch (Exception err)
                 {
-                    // max out at 5 attempts to connect ~1 minute
-                    if (attempt++ < maxAttempts)
+                    if (ShouldRetry())
                     {
-                        Thread.Sleep(15000);
                         continue;
                     }
                     _stateManager.IsConnecting = false;
@@ -1042,9 +1065,17 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 // we need to tell the DefaultBrokerageMessageHandler we are connected else he will kill us
                 OnMessage(BrokerageMessageEvent.Reconnected("Connect() finished successfully"));
             }
+            else if (_isDisposeCalled || _cancellationTokenSource.IsCancellationRequested)
+            {
+                // we stopped trying because the brokerage is shutting down, nothing to report
+                Log.Trace("InteractiveBrokersBrokerage.Connect(): aborted, brokerage is shutting down");
+            }
             else
             {
-                OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Error, "ConnectionState", "Unexpected, not connected state. Unable to connect to Interactive Brokers. Terminating algorithm."));
+                // we only reach here when a finite ib-connect-max-attempts cap was configured and exhausted without a
+                // thrown exception; emit a Disconnected event (Lean grace period) rather than a fatal Error so the
+                // heart beat thread and Lean's reconnect timer can keep trying instead of terminating immediately
+                OnMessage(BrokerageMessageEvent.Disconnected("Could not connect to Interactive Brokers after the configured number of attempts. Retrying..."));
             }
         }
 
@@ -1056,26 +1087,42 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                 return true;
             }
 
-            if (!_isDisposeCalled &&
-                _ibAutomater?.IsWithinScheduledServerResetTimes() != true &&
-                IsConnected &&
-                // do not run heart beat if we are close to daily restarts
-                DateTime.Now.TimeOfDay < _heartBeatTimeLimit &&
-                // do not run heart beat if we are restarting
-                !IsRestartInProgress())
+            // skip the heart beat while shutting down, within an IB scheduled reset, close to the daily restart,
+            // while a gateway restart is in progress, or while a (re)connection attempt is already running
+            if (_isDisposeCalled ||
+                _ibAutomater?.IsWithinScheduledServerResetTimes() == true ||
+                DateTime.Now.TimeOfDay >= _heartBeatTimeLimit ||
+                IsRestartInProgress() ||
+                _stateManager.IsConnecting)
             {
-                _currentTimeEvent.Reset();
-                // request current time to the server
-                _client.ClientSocket.reqCurrentTime();
-                var result = _currentTimeEvent.WaitOne(Time.GetSecondUnevenWait(waitTimeMs), _cancellationTokenSource.Token);
-                if (!result)
-                {
-                    Log.Error("InteractiveBrokersBrokerage.HeartBeat(): failed!", overrideMessageFloodProtection: true);
-                }
-                return result;
+                // expected
+                return true;
             }
-            // expected
-            return true;
+
+            if (!IsConnected)
+            {
+                // the API connection dropped (e.g. TWS/Gateway socket closed or the process exited) while we are
+                // not shutting down and not within an expected reset/restart window. The ConnectionClosed callback
+                // does not trigger a reconnect by itself, so report a heart beat failure here to drive the
+                // reconnection path. Only do this once we have connected at least once.
+                if (_pastFirstConnection)
+                {
+                    Log.Error("InteractiveBrokersBrokerage.HeartBeat(): connection lost outside of expected windows, will reconnect", overrideMessageFloodProtection: true);
+                    return false;
+                }
+                // expected
+                return true;
+            }
+
+            _currentTimeEvent.Reset();
+            // request current time to the server
+            _client.ClientSocket.reqCurrentTime();
+            var result = _currentTimeEvent.WaitOne(Time.GetSecondUnevenWait(waitTimeMs), _cancellationTokenSource.Token);
+            if (!result)
+            {
+                Log.Error("InteractiveBrokersBrokerage.HeartBeat(): failed!", overrideMessageFloodProtection: true);
+            }
+            return result;
         }
 
         private void RunHeartBeatThread()
@@ -1090,19 +1137,28 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
                     {
                         if (!HeartBeat(waitTimeMs))
                         {
-                            // just in case we were unlucky, we are reconnecting or similar let's retry with a longer wait
-                            if (!HeartBeat(waitTimeMs * 3))
+                            // a dropped connection is definitive, reconnect right away; a ping timeout while still
+                            // connected might be a transient hiccup, so for that case we double-check once with a longer wait
+                            if (!IsConnected || !HeartBeat(waitTimeMs * 3))
                             {
-                                // we emit the disconnected event so that if the re connection below fails it will kill the algorithm
+                                // we emit the disconnected event so that Lean's reconnect timer is armed: if the
+                                // gateway/TWS stays down past the configured grace (see ib-max-disconnect-minutes)
+                                // Lean will stop the algorithm; if it comes back, Connect() emits Reconnected and cancels it
                                 OnMessage(BrokerageMessageEvent.Disconnected("Connection with Interactive Brokers lost. Heart beat failed."));
+
+                                // Connect() retries internally (ib-connect-max-attempts, default unlimited) until it
+                                // reconnects, is cancelled/disposed, or hits a fatal error, so a single call here keeps
+                                // waiting for the gateway/TWS to come back. Wrapped in try so a throw doesn't kill the
+                                // heart beat thread; the next heart beat cycle will try again.
                                 try
                                 {
                                     Disconnect();
+                                    Connect();
                                 }
-                                catch (Exception)
+                                catch (Exception reconnectError)
                                 {
+                                    Log.Error(reconnectError, "InteractiveBrokersBrokerage.HeartBeat(): reconnection attempt failed");
                                 }
-                                Connect();
                             }
                             else
                             {
@@ -2017,6 +2073,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
             var requestId = e.Id;
             var errorCode = e.Code;
             var errorMsg = e.Message;
+
+            // connection-level errors (code -1) carry the full exception text including a stack trace. While we are
+            // (re)connecting to a TWS/Gateway that is down these repeat on every attempt, so keep only the first line
+            // (exception type and message) to avoid flooding the logs with identical stack traces.
+            if (errorCode == -1 && !string.IsNullOrEmpty(errorMsg))
+            {
+                var newLineIndex = errorMsg.IndexOf('\n');
+                if (newLineIndex > 0)
+                {
+                    errorMsg = errorMsg.Substring(0, newLineIndex).TrimEnd('\r', ' ');
+                }
+            }
 
             // rewrite these messages to be single lined
             errorMsg = errorMsg.Replace("\r\n", ". ").Replace("\r", ". ").Replace("\n", ". ");

@@ -61,6 +61,18 @@ namespace QuantConnect.Brokerages.InteractiveBrokers
         public override IBrokerageModel GetBrokerageModel(IOrderProvider orderProvider) => new InteractiveBrokersBrokerageModel();
 
         /// <summary>
+        /// Gets a brokerage message handler whose disconnect grace period is configurable via
+        /// <c>ib-max-disconnect-minutes</c> (default 180). While exchanges are open, a lost connection only
+        /// terminates the algorithm if it is not restored within this window, so a TWS/Gateway maintenance restart
+        /// or transient outage is ridden through (the brokerage keeps reconnecting) instead of killing the algorithm.
+        /// </summary>
+        public override IBrokerageMessageHandler CreateBrokerageMessageHandler(IAlgorithm algorithm, AlgorithmNodePacket job, IApi api)
+        {
+            var maxDisconnectMinutes = Config.GetDouble("ib-max-disconnect-minutes", 180);
+            return new DefaultBrokerageMessageHandler(algorithm, job, api, TimeSpan.FromMinutes(maxDisconnectMinutes));
+        }
+
+        /// <summary>
         /// Creates a new IBrokerage instance and set ups the environment for the brokerage
         /// </summary>
         /// <param name="job">The job packet to create the brokerage for</param>
